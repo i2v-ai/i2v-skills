@@ -1,7 +1,18 @@
 #!/usr/bin/env node
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { link, lstat, realpath, rm, stat } from 'node:fs/promises';
+import {
+  link,
+  lstat,
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
+import { homedir } from 'node:os';
 import {
   basename,
   dirname,
@@ -17,7 +28,7 @@ import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const DEFAULT_ORIGIN = 'https://i2v.ai';
 const SUBMISSION_TIMEOUT = 18_000;
 const MODEL_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
@@ -274,7 +285,22 @@ async function catalog({ type, task, provider, q } = {}) {
   return data.filter(
     (model) =>
       (!type || model.mediaType === type) &&
-      (!task || match(model.category, task)) &&
+      (!task ||
+        match(model.category, task) ||
+        (task === 'image-generation' &&
+          model.taskTypes?.includes('text-to-image')) ||
+        (task === 'video-generation' &&
+          model.taskTypes?.some(
+            (mode) =>
+              !['text-to-image', 'image-to-image', 'video-to-video'].includes(
+                mode
+              )
+          )) ||
+        (model.taskTypes ?? []).some((mode) => match(mode, task)) ||
+        (task === 'image-editing' &&
+          model.taskTypes?.includes('image-to-image')) ||
+        (task === 'video-editing' &&
+          model.taskTypes?.includes('video-to-video'))) &&
       (!provider || match(model.provider, provider)) &&
       (!q ||
         match(
@@ -527,6 +553,129 @@ async function quote(model, inputs, protocol, timeout) {
   );
 }
 
+const stateHome = () =>
+  process.env.I2V_STATE_DIR ??
+  join(
+    process.env.LOCALAPPDATA ||
+      process.env.XDG_STATE_HOME ||
+      join(homedir(), '.local', 'state'),
+    'i2v-ai'
+  );
+
+async function beginReceipt(modelId, idempotencyKey) {
+  const dir = join(stateHome(), 'receipts');
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const hash = createHash('sha256')
+    .update(
+      JSON.stringify([origin(), process.env.I2V_API_KEY?.trim(), idempotencyKey])
+    )
+    .digest('hex');
+  const path = join(dir, hash + '.json');
+  const data = {
+    modelId,
+    idempotencyKey,
+    origin: origin(),
+    createdAt: new Date().toISOString(),
+    status: 'submitting',
+  };
+  try {
+    await writeFile(path, JSON.stringify(data) + '\n', {
+      flag: 'wx',
+      mode: 0o600,
+    });
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+  }
+  return { path, data };
+}
+
+async function finishReceipt(receipt, taskId) {
+  const original = JSON.parse(await readFile(receipt.path, 'utf8'));
+  if (original.modelId !== receipt.data.modelId) return;
+  const temporary = receipt.path + '.' + randomUUID() + '.tmp';
+  try {
+    await writeFile(
+      temporary,
+      JSON.stringify({ ...original, taskId, status: 'accepted' }) + '\n',
+      { flag: 'wx', mode: 0o600 }
+    );
+    await rename(temporary, receipt.path);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => {});
+  }
+}
+
+async function prepare(model, inputs, maxCostUsd) {
+  if (maxCostUsd !== undefined) usdAtoms(maxCostUsd);
+  return tool('prepare_generation', {
+    modelId: modelId(model),
+    inputs: inputObject(inputs),
+    maxCostUsd,
+  });
+}
+
+async function doctor() {
+  const [models, connection] = await Promise.all([
+    catalog(),
+    process.env.I2V_API_KEY?.trim()
+      ? (async () => {
+          try {
+            const id = randomUUID();
+            const handshake = await rpc({
+              jsonrpc: '2.0',
+              id,
+              method: 'initialize',
+              params: {
+                protocolVersion: '2025-11-25',
+                capabilities: {},
+                clientInfo: { name: 'i2v-cli-doctor', version: VERSION },
+              },
+            });
+            if (handshake?.id !== id || !handshake.result?.protocolVersion)
+              throw new CliError(
+                'protocol_error',
+                'MCP initialization failed.'
+              );
+            const manifestId = randomUUID();
+            const manifest = await rpc(
+              { jsonrpc: '2.0', id: manifestId, method: 'tools/list' },
+              handshake.result.protocolVersion
+            );
+            if (
+              manifest?.id !== manifestId ||
+              !Array.isArray(manifest.result?.tools)
+            )
+              throw new CliError(
+                'protocol_error',
+                'MCP tool discovery failed.'
+              );
+            const toolNames = manifest.result.tools.map(({ name }) => name);
+            return {
+              status: 'ready',
+              toolNames,
+              missingWorkflowTools: [
+                'recommend_models',
+                'prepare_generation',
+                'recover_submission',
+              ].filter((name) => !toolNames.includes(name)),
+            };
+          } catch (error) {
+            return {
+              status: 'unavailable',
+              code: error.code ?? 'connection_failed',
+            };
+          }
+        })()
+      : { status: 'not_configured' },
+  ]);
+  return {
+    cliVersion: VERSION,
+    endpoint: origin(),
+    catalogModels: models.length,
+    connection,
+  };
+}
+
 async function submit(
   { modelId: model, inputs, maxCostUsd, idempotencyKey, replay, ...optional },
   protocol,
@@ -554,6 +703,12 @@ async function submit(
       );
     }
   }
+  const savedReceipt = await beginReceipt(model, key).catch(() => {
+    throw new CliError(
+      'receipt_unavailable',
+      'Could not save the local submission receipt. No task was submitted.'
+    );
+  });
   receipt?.(key);
   try {
     const result = await tool(
@@ -570,16 +725,26 @@ async function submit(
     );
     if (typeof result?.taskId !== 'string' || !result.taskId)
       throw new CliError('protocol_error', 'Missing task ID.');
-    return { ...result, idempotencyKey: key };
+    let receiptUpdated = true;
+    await finishReceipt(savedReceipt, result.taskId).catch(() => {
+      receiptUpdated = false;
+    });
+    return {
+      ...result,
+      idempotencyKey: key,
+      receiptPath: savedReceipt.path,
+      receiptUpdated,
+    };
   } catch (error) {
     const next =
-      'To recover an uncertain submission, replay the original inputs and budget with the same key.';
+      'Use recover with the same key to look for the original task. Replay only with the exact original inputs, budget, and options.';
     throw new CliError(
       error.code || 'submission_unknown',
       error.message || next,
       {
         ...error.details,
         idempotencyKey: key,
+        receiptPath: savedReceipt.path,
         next,
       }
     );
@@ -705,6 +870,8 @@ async function callLocal(name, args, protocol) {
       replay,
       callBackUrl,
       autoFix,
+      expectedRevision,
+      recoveryScope,
     } = args;
     if (replay !== undefined && typeof replay !== 'boolean')
       throw invalid('replay must be a boolean.');
@@ -717,6 +884,8 @@ async function callLocal(name, args, protocol) {
         replay,
         callBackUrl,
         autoFix,
+        expectedRevision,
+        recoveryScope,
       },
       protocol,
       undefined,
@@ -839,17 +1008,22 @@ const HELP = `i2v.ai CLI ${VERSION} · Node.js 20+
   list [--type image|video] [--task CATEGORY] [--provider BRAND] [--q QUERY]
   doc MODEL [--schema] [--locale en|zh]
   price [QUERY]
+  recommend [QUERY] [--task TYPE] [--model MODEL] [--input CONSTRAINTS_JSON]
+  plan MODEL (--input JSON | --input-file FILE | --stdin) [--max-cost-usd USD]
+  recover IDEMPOTENCY_KEY
+  doctor
   balance
   quote MODEL (--input JSON | --input-file FILE | --stdin)
   upload FILE [--content-type MIME]
   run MODEL (--input JSON | --input-file FILE | --stdin) --max-cost-usd USD
-            [--idempotency-key KEY] [--replay] [--no-wait | --wait SECONDS]
+            [--expected-revision N] [--idempotency-key KEY] [--replay] [--no-wait | --wait SECONDS]
             [--out FILE | --out-dir EXISTING_DIR]
   status TASK_ID [--wait SECONDS] [--out FILE | --out-dir EXISTING_DIR]
   mcp
 
 Pass --json for structured results. Set I2V_API_KEY for account and task actions.
 I2V_MAX_COST_USD supplies a default spending ceiling.
+I2V_STATE_DIR overrides where local submission receipts are saved.
 I2V_WORKSPACE_DIR enables local MCP file tools and sets the CLI file root.
 I2V_BASE_URL overrides the API origin. It must be trusted before forwarding a key.
 `;
@@ -858,6 +1032,8 @@ const flags = {
   json: 'boolean',
   type: 'string',
   task: 'string',
+  model: 'string',
+  'expected-revision': 'string',
   provider: 'string',
   q: 'string',
   schema: 'boolean',
@@ -880,6 +1056,10 @@ const commands = {
   list: [0, 0, ['type', 'task', 'provider', 'q']],
   doc: [1, 1, ['schema', 'locale']],
   price: [0, 1, []],
+  recommend: [0, 1, ['task', 'model', ...inputFlags]],
+  plan: [1, 1, [...inputFlags, 'max-cost-usd']],
+  recover: [1, 1, []],
+  doctor: [0, 0, []],
   balance: [0, 0, []],
   quote: [1, 1, inputFlags],
   upload: [1, 1, ['content-type']],
@@ -890,6 +1070,7 @@ const commands = {
       ...inputFlags,
       ...outputFlags,
       'max-cost-usd',
+      'expected-revision',
       'idempotency-key',
       'replay',
       'no-wait',
@@ -994,6 +1175,33 @@ async function main() {
         result = await api('/api/docs/markdown?' + query);
       }
       break;
+    case 'recommend': {
+      const constraints = inputFlags.some((flag) => values[flag] !== undefined)
+        ? await readInput(values, workspace)
+        : {};
+      result = await tool('recommend_models', {
+        ...constraints,
+        ...(arg ? { query: arg } : {}),
+        ...(values.task ? { task: values.task } : {}),
+        ...(values.model ? { modelId: values.model } : {}),
+      });
+      break;
+    }
+    case 'plan':
+      result = await prepare(
+        arg,
+        await readInput(values, workspace),
+        values['max-cost-usd']
+      );
+      break;
+    case 'recover':
+      result = await tool('recover_submission', {
+        idempotencyKey: operationKey(arg),
+      });
+      break;
+    case 'doctor':
+      result = await doctor();
+      break;
     case 'price':
       result = publishedPrices(await catalog({ q: arg }));
       break;
@@ -1018,6 +1226,12 @@ async function main() {
       await checkOutput(workspace, values.out, values['out-dir']);
       if (values.replay && !values['idempotency-key'])
         throw invalid('--replay requires the original --idempotency-key.');
+      const revision = values['expected-revision'];
+      if (
+        revision !== undefined &&
+        (!/^\d+$/.test(revision) || !Number.isSafeInteger(Number(revision)))
+      )
+        throw invalid('--expected-revision must be a nonnegative integer.');
       result = await submit(
         {
           modelId: arg,
@@ -1025,6 +1239,9 @@ async function main() {
           maxCostUsd: values['max-cost-usd'],
           idempotencyKey: values['idempotency-key'] ?? randomUUID(),
           replay: values.replay,
+          ...(revision !== undefined
+            ? { expectedRevision: Number(revision) }
+            : {}),
         },
         undefined,
         (key) => console.error('[i2v] Idempotency-Key: ' + key)
@@ -1052,7 +1269,9 @@ async function main() {
       break;
   }
   emitted(result, values.json);
-  if (result?.status === 'fail') process.exitCode = 1;
+  if (result?.status === 'fail' || result?.connection?.status === 'unavailable')
+    process.exitCode = 1;
+  if (result?.status === 'over_budget') process.exitCode = 3;
 }
 
 main().catch((error) => {
