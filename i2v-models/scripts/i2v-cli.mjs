@@ -28,7 +28,7 @@ import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const DEFAULT_ORIGIN = 'https://i2v.ai';
 const SUBMISSION_TIMEOUT = 18_000;
 const MODEL_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
@@ -138,6 +138,7 @@ const fixedApiPaths = new Set([
   '/api/mcp',
   '/api/v1/generation-models',
   '/api/docs/markdown',
+  '/cli/release.json',
 ]);
 
 async function api(
@@ -614,9 +615,57 @@ async function prepare(model, inputs, maxCostUsd) {
   });
 }
 
+const releaseVersion = /^\d{1,8}\.\d{1,8}\.\d{1,8}$/;
+
+function versionReport(current, published) {
+  const available = typeof published === 'string' && releaseVersion.test(published);
+  if (typeof current !== 'string' || !releaseVersion.test(current))
+    return { current: null, published: available ? published : null, status: 'not_detected' };
+  if (!available)
+    return { current, published: null, status: 'unavailable' };
+  const expected = published.split('.').map(Number);
+  const diff =
+    current.split('.').map((part, index) => Number(part) - expected[index]).find(Boolean) ?? 0;
+  return {
+    current,
+    published,
+    status: diff < 0 ? 'update_available' : diff > 0 ? 'ahead' : 'current',
+  };
+}
+
+async function localSkillVersion() {
+  try {
+    const markdown = await readFile(new URL('../SKILL.md', import.meta.url), 'utf8');
+    const header = markdown.split('---', 3)[1] ?? '';
+    return /^name: i2v-models\s*$/m.test(header)
+      ? /^  version: ["']?(\d+\.\d+\.\d+)["']?\s*$/m.exec(header)?.[1]
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readRelease(timeout = 6000) {
+  return api('/cli/release.json', { timeout }).catch(() => null);
+}
+
+function addUpdateInstructions(result, release, skillVersion) {
+  const updates = [
+    ['CLI', versionReport(VERSION, release?.cliVersion)],
+    ['Agent Skill', versionReport(skillVersion, release?.skillVersion)],
+    ['MCP server', versionReport(result.serverInfo?.version, release?.mcpServerVersion)],
+  ].filter(([, report]) => report.status === 'update_available');
+  if (!updates.length) return;
+  const versions = updates.map(([name, report]) => `${name} ${report.current} → ${report.published}`);
+  const message = `i2v.ai updates available (${versions.join(', ')}). Run the i2v.ai CLI doctor command for details.`;
+  result.instructions = [result.instructions, message].filter(Boolean).join('\n');
+}
+
 async function doctor() {
-  const [models, connection] = await Promise.all([
-    catalog(),
+  const [models, release, skillVersion, connection] = await Promise.all([
+    catalog().catch(() => null),
+    readRelease(),
+    localSkillVersion(),
     process.env.I2V_API_KEY?.trim()
       ? (async () => {
           try {
@@ -652,11 +701,14 @@ async function doctor() {
             const toolNames = manifest.result.tools.map(({ name }) => name);
             return {
               status: 'ready',
+              protocolVersion: handshake.result.protocolVersion,
+              serverVersion: handshake.result.serverInfo?.version,
               toolNames,
               missingWorkflowTools: [
                 'recommend_models',
                 'prepare_generation',
                 'recover_submission',
+                'get_usage',
               ].filter((name) => !toolNames.includes(name)),
             };
           } catch (error) {
@@ -671,8 +723,14 @@ async function doctor() {
   return {
     cliVersion: VERSION,
     endpoint: origin(),
-    catalogModels: models.length,
+    catalogModels: models?.length ?? null,
     connection,
+    updates: {
+      cli: versionReport(VERSION, release?.cliVersion),
+      skill: versionReport(skillVersion, release?.skillVersion),
+      remoteMcp: versionReport(connection.serverVersion, release?.mcpServerVersion),
+      setupUrl: new URL('/mcp', origin()).href,
+    },
   };
 }
 
@@ -936,10 +994,19 @@ async function stdio() {
           result = toolFailure(error);
         }
         reply = { jsonrpc: '2.0', id, result };
+      } else if (method === 'initialize') {
+        const [initialized, release, skillVersion] = await Promise.all([
+          rpc(message, protocol),
+          readRelease(2000),
+          localSkillVersion(),
+        ]);
+        reply = initialized;
+        if (reply?.result) {
+          protocol = reply.result.protocolVersion;
+          addUpdateInstructions(reply.result, release, skillVersion);
+        }
       } else {
         reply = await rpc(message, protocol);
-        if (method === 'initialize' && reply?.result)
-          protocol = reply.result.protocolVersion;
         if (method === 'tools/list' && reply?.result?.tools) {
           const create = reply.result.tools.find(
             (item) => item.name === 'create_task'
@@ -1013,6 +1080,7 @@ const HELP = `i2v.ai CLI ${VERSION} · Node.js 20+
   recover IDEMPOTENCY_KEY
   doctor
   balance
+  usage [--range today|yesterday|7d|30d|90d]
   quote MODEL (--input JSON | --input-file FILE | --stdin)
   upload FILE [--content-type MIME]
   run MODEL (--input JSON | --input-file FILE | --stdin) --max-cost-usd USD
@@ -1032,6 +1100,7 @@ const flags = {
   json: 'boolean',
   type: 'string',
   task: 'string',
+  range: 'string',
   model: 'string',
   'expected-revision': 'string',
   provider: 'string',
@@ -1061,6 +1130,7 @@ const commands = {
   recover: [1, 1, []],
   doctor: [0, 0, []],
   balance: [0, 0, []],
+  usage: [0, 0, ['range']],
   quote: [1, 1, inputFlags],
   upload: [1, 1, ['content-type']],
   run: [
@@ -1210,6 +1280,9 @@ async function main() {
       result = { balance, reserved, funding };
       break;
     }
+    case 'usage':
+      result = await tool('get_usage', { range: values.range });
+      break;
     case 'quote':
       result = await quote(arg, await readInput(values, workspace));
       break;

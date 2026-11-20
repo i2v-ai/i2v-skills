@@ -1,15 +1,17 @@
 ---
 name: i2v-models
-description: Generate or edit images and create videos with i2v.ai. Use for i2v.ai model discovery, live USD quotes, local reference media uploads, generation, task recovery, or saving generated assets into a project.
+description: Generate or edit images and create videos with i2v.ai. Use for model discovery, live USD quotes, account balance or usage, local media uploads, generation, task recovery, or saving generated assets.
 compatibility: Use the connected i2v.ai MCP server or Node.js 20+ with the bundled CLI. Account operations require a configured API key or an authorized MCP connection.
 metadata:
   author: i2v.ai
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # i2v.ai models
 
 Use the connected i2v.ai MCP server for cloud operations. Use the bundled `scripts/i2v-cli.mjs` for shell workflows or local files. Resolve the script relative to this skill directory. Run CLI commands from the user's project so relative file paths are meaningful.
+
+For an account question, call `get_account` for available and reserved USD and `get_usage` for settled spend over the requested period. The CLI equivalents are `node SCRIPT balance --json` and `node SCRIPT usage --range 30d --json`. Report amounts and the UTC window without creating a task. For setup problems or a missing tool, use `node SCRIPT doctor --json` and follow the [connection and update guide](references/workflow.md).
 
 1. Discover current public models with `list_models` or `node SCRIPT list --type image --json`. When no model is specified, use `recommend_models` or `node SCRIPT recommend "REQUEST" --json` to find candidates. Keep an explicitly requested model and report any incompatible constraints. Use the public model ID, then read `get_model_params` or `node SCRIPT doc MODEL`. Check mode, required fields, supported media slots and real model IDs before forming inputs.
 2. Use existing media URLs when available. For an authorized local reference file, call the local MCP `upload_file` tool or run `node SCRIPT upload ./reference.png --json`. Put the returned ready asset URL in the documented input field. Upload only files the user named or provided for this task.
