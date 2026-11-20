@@ -17,6 +17,8 @@ Use `node SCRIPT doc MODEL --schema` for machine-readable constraints. Use `node
 
 `run --no-wait` returns the task receipt as soon as available. Use `status TASK_ID --wait 120` to resume without a new charge. The default `run` wait is 300 seconds. When submitting a reviewed plan, include `--expected-revision` from its result. Recheck if the model revision changes. The CLI stores the operation key before submitting and updates the receipt when a task ID arrives. Receipts contain the model ID, endpoint, key, time and known task ID. Override the local directory with `I2V_STATE_DIR`. Use `recover KEY` with the same credential to look up the server receipt. A local wait ending does not cancel the remote task.
 
+When polling receives a rate limit or temporary gateway failure, the CLI retries the same task within the requested wait and follows `Retry-After`. If the wait ends first, resume later with the same task ID.
+
 ## Account and connection checks
 
 - `get_account` shows available and reserved USD, funding categories, and the connection scopes. `get_usage` reports charges, usage refunds, verified historical net usage and total net usage. It accepts `today`, `yesterday`, `7d`, `30d` or `90d`, and uses UTC booking dates. These are account totals across channels. For API keys, the REST equivalents are `GET /api/v1/account` and `GET /api/v1/account/usage?range=30d`.

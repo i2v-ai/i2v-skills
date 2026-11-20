@@ -4,7 +4,7 @@ description: Generate or edit images and create videos with i2v.ai. Use for mode
 compatibility: Use the connected i2v.ai MCP server or Node.js 20+ with the bundled CLI. Account operations require a configured API key or an authorized MCP connection.
 metadata:
   author: i2v.ai
-  version: "1.2.0"
+  version: "1.2.1"
 ---
 
 # i2v.ai models

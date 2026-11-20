@@ -28,7 +28,7 @@ import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const DEFAULT_ORIGIN = 'https://i2v.ai';
 const SUBMISSION_TIMEOUT = 18_000;
 const MODEL_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
@@ -827,10 +827,11 @@ async function readTask(id, waitSeconds, protocol) {
       if (['success', 'fail'].includes(last.status))
         return { ...last, taskId: id };
     } catch (error) {
-      if (
-        !waitSeconds ||
-        !['rate_limited', 'connection_failed', '503'].includes(error.code)
-      ) {
+      const status = error.details?.status;
+      const retryable =
+        ['rate_limited', 'connection_failed', '503'].includes(error.code) ||
+        [429, 502, 503, 504].includes(status);
+      if (!waitSeconds || !retryable) {
         throw new CliError(
           error.code || 'status_unavailable',
           error instanceof CliError
@@ -839,7 +840,10 @@ async function readTask(id, waitSeconds, protocol) {
           { ...error.details, taskId: id }
         );
       }
-      const retryAfter = Number(error.details?.retryAfter) * 1000;
+      const header = error.details?.retryAfter;
+      const retryAfter = /^\d+$/.test(header ?? '')
+        ? Number(header) * 1000
+        : Date.parse(header ?? '') - Date.now();
       if (retryAfter > 0) backoff = Math.max(backoff, retryAfter);
     }
     if (Date.now() + backoff >= deadline)
