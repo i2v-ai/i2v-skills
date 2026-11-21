@@ -1,0 +1,13 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "i2v-ai",
+  "version": "1.0.1",
+  "description": "Generate images and videos or integrate the i2v.ai media API into your application.",
+  "author": {
+    "name": "i2v.ai",
+    "url": "https://i2v.ai"
+  },
+  "homepage": "https://i2v.ai/mcp",
+  "repository": "https://github.com/i2v-ai/i2v-skills",
+  "license": "MIT"
+}

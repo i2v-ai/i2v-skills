@@ -1,0 +1,13 @@
+{
+  "name": "i2v-ai",
+  "description": "Claude Code plugins published by i2v.ai.",
+  "owner": {
+    "name": "i2v.ai"
+  },
+  "plugins": [
+    {
+      "name": "i2v-ai",
+      "source": "./"
+    }
+  ]
+}
